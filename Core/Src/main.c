@@ -5,11 +5,12 @@
 #include <math.h>
 
 /* CẤU HÌNH VÀ BIẾN */
-#define MOVING_AVERAGE_SIZE 5
-#define I2C_LCD_ADDR (0x27 << 1)
+/* NOTE: Khu vực này khai báo các hằng số, chế độ hoạt động và biến dùng chung cho toàn hệ thống. */
+#define MOVING_AVERAGE_SIZE 5        // NOTE: Lấy trung bình 5 mẫu đo để giảm nhiễu cảm biến
+#define I2C_LCD_ADDR (0x27 << 1)    // NOTE: Địa chỉ LCD I2C, nếu LCD không hiện có thể cần đổi 0x27 thành 0x3F
 
-typedef enum { BOOT_MODE = 0, AUTO_MODE, MANUAL_MODE } Mode_t;
-typedef enum { STATE_SAFE = 0, STATE_WARNING, STATE_DANGER } Safety_t;
+typedef enum { BOOT_MODE = 0, AUTO_MODE, MANUAL_MODE } Mode_t;       // NOTE: 3 chế độ: chờ khởi động, tự động, điều khiển tay
+typedef enum { STATE_SAFE = 0, STATE_WARNING, STATE_DANGER } Safety_t; // NOTE: 3 mức cảnh báo theo khoảng cách
 
 I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart1;
@@ -17,8 +18,8 @@ UART_HandleTypeDef huart1;
 volatile Mode_t current_mode = BOOT_MODE;     // Bắt đầu ở Boot Mode
 volatile Safety_t safety_state = STATE_SAFE;
 
-volatile uint32_t rawDistance = 150;
-volatile float filtered_distance = 150.0f;
+volatile uint32_t rawDistance = 150;          // NOTE: Khoảng cách đo trực tiếp từ HC-SR04, đơn vị cm
+volatile float filtered_distance = 150.0f;  // NOTE: Khoảng cách sau khi lọc trung bình
 float previous_distance = 150.0f;
 
 uint32_t last_sensor_time = 0;
@@ -30,7 +31,7 @@ uint32_t brake_start_time = 0;
 
 volatile uint8_t is_braking_active = 0;
 float current_speed_m_s = 0.0f;
-volatile float d_safe = 30.0f;
+volatile float d_safe = 30.0f;                // NOTE: Khoảng cách an toàn động, dùng để quyết định phanh
 
 volatile char rx_buffer = 0;
 volatile uint8_t rx_flag = 0;
@@ -64,11 +65,13 @@ const char* Get_Safety_Text(Safety_t state);
 /* ========================================================================== */
 /* INIT FUNCTIONS */
 /* ========================================================================== */
+/* NOTE: Hàm delay ngắn theo micro giây, dùng để tạo xung TRIG 10us cho cảm biến siêu âm. */
 void Delay_us(volatile uint32_t au32microseconds) {
     au32microseconds *= 3;
     while (au32microseconds--);
 }
 
+/* NOTE: Cấu hình chân GPIO ở mức thanh ghi: cảm biến, LED, buzzer, motor, UART và LCD I2C. */
 void GPIO_Init_RegisterLevel(void) {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
 
@@ -112,6 +115,7 @@ void GPIO_Init_RegisterLevel(void) {
     GPIOB->AFR[1] &= ~(0xF << 0);  GPIOB->AFR[1] |= (4 << 0);
 }
 
+/* NOTE: Khởi tạo TIM1 để tạo PWM điều khiển motor và TIM3 để đo xung ECHO của cảm biến. */
 void Timers_Init(void) {
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
     TIM1->PSC = 159; TIM1->ARR = 99;
@@ -131,6 +135,7 @@ void Timers_Init(void) {
     TIM3->CR1 |= TIM_CR1_CEN;
 }
 
+/* NOTE: Khởi tạo UART1 tốc độ 9600 để nhận lệnh từ Bluetooth/app điện thoại. */
 void Local_MX_USART1_UART_Init(void) {
     __HAL_RCC_USART1_CLK_ENABLE();
     huart1.Instance = USART1;
@@ -147,6 +152,7 @@ void Local_MX_USART1_UART_Init(void) {
     HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
+/* NOTE: Khởi tạo I2C1 để giao tiếp với màn hình LCD 16x2 qua module I2C. */
 void Local_MX_I2C1_Init(void) {
     __HAL_RCC_I2C1_CLK_ENABLE();
     hi2c1.Instance = I2C1;
@@ -162,6 +168,7 @@ void Local_MX_I2C1_Init(void) {
 }
 
 /* LCD */
+/* NOTE: Nhóm hàm LCD dùng để gửi lệnh, gửi ký tự, đặt con trỏ và in dữ liệu lên LCD. */
 void LCD_Write(uint8_t data, uint8_t control_bits) {
     uint8_t data_u = data & 0xF0;
     uint8_t data_l = (data << 4) & 0xF0;
@@ -206,10 +213,12 @@ void LCD_Print_Num(uint32_t num) {
 }
 
 /* UART & Motor & Safety */
+/* NOTE: Gửi chuỗi debug/trạng thái qua UART. */
 void UART_SendString(const char *str) {
     HAL_UART_Transmit(&huart1, (uint8_t*)str, strlen(str), 100);
 }
 
+/* NOTE: Điều khiển 2 motor. Giá trị dương = tiến, âm = lùi, 0 = dừng. */
 void Set_Motor(int8_t speed_A, int8_t speed_B) {
     if (speed_A > 0) { GPIOC->BSRR = (1 << 0) | (1 << (1 + 16)); TIM1->CCR1 = speed_A; }
     else if (speed_A < 0) { GPIOC->BSRR = (1 << 1) | (1 << (0 + 16)); TIM1->CCR1 = -speed_A; }
@@ -220,12 +229,14 @@ void Set_Motor(int8_t speed_A, int8_t speed_B) {
     else { GPIOC->BSRR = (1 << (2 + 16)) | (1 << (3 + 16)); TIM1->CCR2 = 0; }
 }
 
+/* NOTE: Chuyển trạng thái an toàn thành chữ để hiển thị lên LCD. */
 const char* Get_Safety_Text(Safety_t state) {
     if (state == STATE_SAFE) return "SAFE";
     else if (state == STATE_WARNING) return "WARN";
     else return "DANGER";
 }
 
+/* NOTE: Bật LED/buzzer theo trạng thái SAFE, WARN hoặc DANGER. */
 void Set_Hardware_Alerts(Safety_t state) {
     GPIOC->BSRR = (1 << (6 + 16)) | (1 << (8 + 16)) | (1 << (9 + 16));
     GPIOA->BSRR = (1 << (0 + 16));
@@ -237,6 +248,7 @@ void Set_Hardware_Alerts(Safety_t state) {
     }
 }
 
+/* NOTE: Cập nhật trạng thái an toàn và tự phanh nếu xe đang ở AUTO_MODE. */
 void Update_Safety_And_Motors(void) {
     float cur_d = filtered_distance;
     if (cur_d >= 100.0f) safety_state = STATE_SAFE;
@@ -265,6 +277,8 @@ void Update_Safety_And_Motors(void) {
 }
 
 /* INTERRUPTS */
+/* NOTE: Các hàm ngắt xử lý sự kiện xảy ra bất ngờ, ví dụ có xung ECHO hoặc có dữ liệu Bluetooth. */
+/* NOTE: Ngắt TIM3 đo độ rộng xung ECHO để tính khoảng cách từ cảm biến siêu âm. */
 void TIM3_IRQHandler(void) {
     static uint32_t t_start = 0;
     if (TIM3->SR & TIM_SR_CC1IF) {
@@ -291,6 +305,7 @@ void TIM3_IRQHandler(void) {
     }
 }
 
+/* NOTE: Callback UART được gọi khi STM32 nhận được 1 ký tự từ Bluetooth. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
         char temp_char = (char)hal_rx_byte;
@@ -309,6 +324,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 /* ========================================================================== */
 /* MAIN */
 /* ========================================================================== */
+/* NOTE: Hàm main khởi tạo toàn bộ hệ thống và chạy vòng lặp điều khiển chính. */
 int main(void) {
     HAL_Init();
     GPIO_Init_RegisterLevel();
@@ -328,6 +344,7 @@ int main(void) {
         uint32_t current_time = HAL_GetTick();
 
         /* Sensor Trigger */
+        /* NOTE: Mỗi 60ms tạo xung TRIG 10us để cảm biến HC-SR04 bắt đầu đo khoảng cách. */
         if (current_time - last_sensor_time >= 60) {
             GPIOA->BSRR = GPIO_BSRR_BS1;
             Delay_us(10);
@@ -336,6 +353,7 @@ int main(void) {
         }
 
         /* Tính d_safe */
+        /* NOTE: Mỗi 1 giây ước lượng tốc độ tiến gần vật cản và tính khoảng cách an toàn. */
         if (current_time - last_velocity_time >= 1000) {
             float delta_d = previous_distance - filtered_distance;
             current_speed_m_s = (delta_d > 0.1f) ? (delta_d / 100.0f) : 0.0f;
@@ -447,6 +465,7 @@ int main(void) {
         }
 
         /* Boot Mode */
+        /* NOTE: Khi mới bật nguồn, xe đứng yên và chờ người dùng chọn AUTO hoặc MANUAL. */
         if (current_mode == BOOT_MODE) {
             Set_Motor(0, 0);
             if (current_time - last_boot_tick >= 1000) {
@@ -457,6 +476,7 @@ int main(void) {
         }
 
         /* LCD Display */
+        /* NOTE: Cập nhật LCD định kỳ: dòng 1 hiển thị mode, dòng 2 hiển thị khoảng cách/trạng thái. */
         if (current_time - last_lcd_time >= 300) {
             LCD_SetCursor(0, 0);
             if (current_mode == BOOT_MODE)
