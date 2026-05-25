@@ -7,13 +7,14 @@
 /* CẤU HÌNH VÀ BIẾN */
 #define MOVING_AVERAGE_SIZE 5
 #define I2C_LCD_ADDR (0x27 << 1)
-#define UART_BAUDRATE 9600U
-#define I2C_TIMEOUT 100000U
 
 typedef enum { BOOT_MODE = 0, AUTO_MODE, MANUAL_MODE } Mode_t;
 typedef enum { STATE_SAFE = 0, STATE_WARNING, STATE_DANGER } Safety_t;
 
-volatile Mode_t current_mode = BOOT_MODE;
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart1;
+
+volatile Mode_t current_mode = BOOT_MODE;     // Bắt đầu ở Boot Mode
 volatile Safety_t safety_state = STATE_SAFE;
 
 volatile uint32_t rawDistance = 150;
@@ -33,18 +34,14 @@ volatile float d_safe = 30.0f;
 
 volatile char rx_buffer = 0;
 volatile uint8_t rx_flag = 0;
-volatile int32_t boot_countdown = 10;
+volatile int32_t boot_countdown = 10;     // Thời gian chờ Boot
 
 uint8_t hal_rx_byte = 0;
 
 /* ========================================================================== */
 /* PROTOTYPES */
 /* ========================================================================== */
-void Timebase_Init_RegisterLevel(void);
-uint32_t Millis(void);
-void Delay_ms(uint32_t ms);
 void Delay_us(volatile uint32_t au32microseconds);
-
 void GPIO_Init_RegisterLevel(void);
 void Timers_Init(void);
 void Local_MX_USART1_UART_Init(void);
@@ -58,7 +55,6 @@ void LCD_SetCursor(uint8_t row, uint8_t col);
 void LCD_Print_Fixed(const char *str);
 void LCD_Print_Num(uint32_t num);
 
-void UART1_PollReceive(void);
 void UART_SendString(const char *str);
 void Set_Motor(int8_t speed_A, int8_t speed_B);
 void Set_Hardware_Alerts(Safety_t state);
@@ -66,36 +62,17 @@ void Update_Safety_And_Motors(void);
 const char* Get_Safety_Text(Safety_t state);
 
 /* ========================================================================== */
-/* TIMEBASE - DWT */
-/* ========================================================================== */
-void Timebase_Init_RegisterLevel(void) {
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-}
-
-uint32_t Millis(void) {
-    return DWT->CYCCNT / (SystemCoreClock / 1000U);
-}
-
-void Delay_ms(uint32_t ms) {
-    uint32_t start = Millis();
-    while ((Millis() - start) < ms);
-}
-
-void Delay_us(volatile uint32_t au32microseconds) {
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = au32microseconds * (SystemCoreClock / 1000000U);
-    while ((DWT->CYCCNT - start) < ticks);
-}
-
-/* ========================================================================== */
 /* INIT FUNCTIONS */
 /* ========================================================================== */
+void Delay_us(volatile uint32_t au32microseconds) {
+    au32microseconds *= 3;
+    while (au32microseconds--);
+}
+
 void GPIO_Init_RegisterLevel(void) {
     RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN | RCC_AHB1ENR_GPIOCEN;
 
-    /* PA0: Buzzer, PA1: TRIG, PA5: LED, PA6: ECHO/TIM3_CH1 */
+    // PA0 Còi, PA1 TRIG, PA5 LED, PA6 ECHO
     GPIOA->MODER &= ~(3 << GPIO_MODER_MODER0_Pos); GPIOA->MODER |= (1 << GPIO_MODER_MODER0_Pos);
     GPIOA->MODER &= ~(3 << GPIO_MODER_MODER1_Pos); GPIOA->MODER |= (1 << GPIO_MODER_MODER1_Pos);
     GPIOA->MODER &= ~(3 << GPIO_MODER_MODER5_Pos); GPIOA->MODER |= (1 << GPIO_MODER_MODER5_Pos);
@@ -103,13 +80,13 @@ void GPIO_Init_RegisterLevel(void) {
     GPIOA->MODER &= ~(3 << GPIO_MODER_MODER6_Pos); GPIOA->MODER |= (2 << GPIO_MODER_MODER6_Pos);
     GPIOA->AFR[0] &= ~(0xF << (6*4)); GPIOA->AFR[0] |= (2 << (6*4));
 
-    /* PWM PA8, PA9 */
+    // PWM PA8, PA9
     GPIOA->MODER &= ~((3 << GPIO_MODER_MODER8_Pos) | (3 << GPIO_MODER_MODER9_Pos));
-    GPIOA->MODER |= (2 << GPIO_MODER_MODER8_Pos) | (2 << GPIO_MODER_MODER9_Pos);
+GPIOA->MODER |= (2 << GPIO_MODER_MODER8_Pos) | (2 << GPIO_MODER_MODER9_Pos);
     GPIOA->AFR[1] &= ~((0xF << 0) | (0xF << 4));
     GPIOA->AFR[1] |= (1 << 0) | (1 << 4);
 
-    /* UART1: PB6 TX - PA10 RX */
+    // UART1: PB6 TX - PA10 RX
     GPIOA->MODER &= ~(3 << GPIO_MODER_MODER10_Pos); GPIOA->MODER |= (2 << GPIO_MODER_MODER10_Pos);
     GPIOA->AFR[1] &= ~(0xF << (10*4 - 32)); GPIOA->AFR[1] |= (7 << (10*4 - 32));
 
@@ -119,21 +96,18 @@ void GPIO_Init_RegisterLevel(void) {
     GPIOA->OSPEEDR |= (3 << (10*2));
     GPIOB->OSPEEDR |= (3 << (6*2));
 
-    /* LED PC6, PC8, PC9 */
+    // LED PC6,8,9
     GPIOC->MODER &= ~((3 << (6*2)) | (3 << (8*2)) | (3 << (9*2)));
     GPIOC->MODER |= ((1 << (6*2)) | (1 << (8*2)) | (1 << (9*2)));
 
-    /* TB6612: PC0, PC1, PC2, PC3 */
+    // TB6612
     GPIOC->MODER &= ~((3 << (0*2)) | (3 << (1*2)) | (3 << (2*2)) | (3 << (3*2)));
     GPIOC->MODER |= ((1 << (0*2)) | (1 << (1*2)) | (1 << (2*2)) | (1 << (3*2)));
 
-    /* I2C1: PB7 SDA, PB8 SCL */
+    // I2C1
     GPIOB->MODER &= ~((3 << (7*2)) | (3 << (8*2)));
     GPIOB->MODER |= ((2 << (7*2)) | (2 << (8*2)));
     GPIOB->OTYPER |= (1 << 7) | (1 << 8);
-    GPIOB->OSPEEDR |= (3 << (7*2)) | (3 << (8*2));
-    GPIOB->PUPDR &= ~((3 << (7*2)) | (3 << (8*2)));
-    GPIOB->PUPDR |= ((1 << (7*2)) | (1 << (8*2)));
     GPIOB->AFR[0] &= ~(0xF << 28); GPIOB->AFR[0] |= (4 << 28);
     GPIOB->AFR[1] &= ~(0xF << 0);  GPIOB->AFR[1] |= (4 << 0);
 }
@@ -158,89 +132,36 @@ void Timers_Init(void) {
 }
 
 void Local_MX_USART1_UART_Init(void) {
-    RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
+    __HAL_RCC_USART1_CLK_ENABLE();
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 9600;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    HAL_UART_Init(&huart1);
 
-    USART1->CR1 = 0;
-    USART1->CR2 = 0;
-    USART1->CR3 = 0;
-
-    USART1->BRR = (SystemCoreClock + (UART_BAUDRATE / 2U)) / UART_BAUDRATE;
-    USART1->CR1 |= USART_CR1_TE | USART_CR1_RE;
-    USART1->CR1 |= USART_CR1_UE;
+    HAL_NVIC_SetPriority(USART1_IRQn, 2, 0);
+    HAL_NVIC_EnableIRQ(USART1_IRQn);
 }
 
 void Local_MX_I2C1_Init(void) {
-    RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
-
-    I2C1->CR1 &= ~I2C_CR1_PE;
-    I2C1->CR1 |= I2C_CR1_SWRST;
-    I2C1->CR1 &= ~I2C_CR1_SWRST;
-
-    uint32_t pclk1_mhz = SystemCoreClock / 1000000U;
-    if (pclk1_mhz < 2U) pclk1_mhz = 2U;
-
-    I2C1->CR2 = pclk1_mhz;
-    I2C1->CCR = SystemCoreClock / (2U * 100000U);
-    if (I2C1->CCR < 4U) I2C1->CCR = 4U;
-    I2C1->TRISE = pclk1_mhz + 1U;
-
-    I2C1->CR1 |= I2C_CR1_ACK;
-    I2C1->CR1 |= I2C_CR1_PE;
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    HAL_I2C_Init(&hi2c1);
 }
 
-/* ========================================================================== */
-/* LCD I2C */
-/* ========================================================================== */
-static uint8_t I2C1_Wait_SR1_Set(uint32_t flag) {
-    uint32_t timeout = I2C_TIMEOUT;
-    while (!(I2C1->SR1 & flag)) {
-        if (--timeout == 0) return 0;
-    }
-    return 1;
-}
-
-static uint8_t I2C1_Wait_SR2_Clear(uint32_t flag) {
-    uint32_t timeout = I2C_TIMEOUT;
-    while (I2C1->SR2 & flag) {
-        if (--timeout == 0) return 0;
-    }
-    return 1;
-}
-
-static void I2C1_Write(uint8_t dev_addr, uint8_t *data, uint16_t len) {
-    volatile uint32_t temp;
-
-    if (!I2C1_Wait_SR2_Clear(I2C_SR2_BUSY)) return;
-
-    I2C1->CR1 |= I2C_CR1_START;
-    if (!I2C1_Wait_SR1_Set(I2C_SR1_SB)) return;
-
-    I2C1->DR = dev_addr & 0xFEU;
-    if (!I2C1_Wait_SR1_Set(I2C_SR1_ADDR)) {
-        I2C1->CR1 |= I2C_CR1_STOP;
-        return;
-    }
-
-    temp = I2C1->SR1;
-    temp = I2C1->SR2;
-    (void)temp;
-
-    for (uint16_t i = 0; i < len; i++) {
-        if (!I2C1_Wait_SR1_Set(I2C_SR1_TXE)) {
-            I2C1->CR1 |= I2C_CR1_STOP;
-            return;
-        }
-        I2C1->DR = data[i];
-    }
-
-    if (!I2C1_Wait_SR1_Set(I2C_SR1_BTF)) {
-        I2C1->CR1 |= I2C_CR1_STOP;
-        return;
-    }
-
-    I2C1->CR1 |= I2C_CR1_STOP;
-}
-
+/* LCD */
 void LCD_Write(uint8_t data, uint8_t control_bits) {
     uint8_t data_u = data & 0xF0;
     uint8_t data_l = (data << 4) & 0xF0;
@@ -250,18 +171,18 @@ void LCD_Write(uint8_t data, uint8_t control_bits) {
         data_l | control_bits | 0x0C,
         data_l | control_bits | 0x08
     };
-    I2C1_Write(I2C_LCD_ADDR, pkt, 4);
+    HAL_I2C_Master_Transmit(&hi2c1, I2C_LCD_ADDR, pkt, 4, 10);
 }
 
 void LCD_Send_Cmd(char cmd)  { LCD_Write(cmd, 0x00); }
 void LCD_Send_Data(char data){ LCD_Write(data, 0x01); }
 
 void LCD_Init(void) {
-    Delay_ms(50);
-    LCD_Send_Cmd(0x02); Delay_ms(10);
-    LCD_Send_Cmd(0x28); Delay_ms(5);
-    LCD_Send_Cmd(0x0C); Delay_ms(5);
-    LCD_Send_Cmd(0x01); Delay_ms(20);
+    HAL_Delay(50);
+    LCD_Send_Cmd(0x02); HAL_Delay(10);
+    LCD_Send_Cmd(0x28); HAL_Delay(5);
+    LCD_Send_Cmd(0x0C); HAL_Delay(5);
+    LCD_Send_Cmd(0x01); HAL_Delay(20);
 }
 
 void LCD_SetCursor(uint8_t row, uint8_t col) {
@@ -284,35 +205,9 @@ void LCD_Print_Num(uint32_t num) {
     while (i--) LCD_Send_Data(buf[i]);
 }
 
-/* ========================================================================== */
-/* UART & MOTOR & SAFETY */
-/* ========================================================================== */
-static void UART1_SendChar(char ch) {
-    while (!(USART1->SR & USART_SR_TXE));
-    USART1->DR = (uint8_t)ch;
-}
-
+/* UART & Motor & Safety */
 void UART_SendString(const char *str) {
-    while (*str) {
-        UART1_SendChar(*str++);
-    }
-    while (!(USART1->SR & USART_SR_TC));
-}
-
-void UART1_PollReceive(void) {
-    if (USART1->SR & USART_SR_RXNE) {
-        char temp_char = (char)(USART1->DR & 0xFF);
-        hal_rx_byte = (uint8_t)temp_char;
-
-        if (temp_char >= 32 && temp_char <= 126) {
-            rx_buffer = temp_char;
-            rx_flag = 1;
-
-            char debug[20];
-            sprintf(debug, "RX:%c\r\n", temp_char);
-            UART_SendString(debug);
-        }
-    }
+    HAL_UART_Transmit(&huart1, (uint8_t*)str, strlen(str), 100);
 }
 
 void Set_Motor(int8_t speed_A, int8_t speed_B) {
@@ -354,24 +249,22 @@ void Update_Safety_And_Motors(void) {
         if (cur_d <= d_safe) {
             if (!is_braking_active) {
                 is_braking_active = 1;
-                brake_start_time = Millis();
-            }
-            if (Millis() - brake_start_time <= 120)
+                brake_start_time = HAL_GetTick();
+}
+            if (HAL_GetTick() - brake_start_time <= 120)
                 Set_Motor(-70, -70);
             else
                 Set_Motor(0, 0);
         } else {
             is_braking_active = 0;
-            TIM1->CCR1 = 40;
+            TIM1->CCR1 = 40; // Cố định tốc độ Auto tiến 50%
             TIM1->CCR2 = 40;
             GPIOC->BSRR = (1u<<0)|(1u<<(1+16))|(1u<<2)|(1u<<(3+16));
         }
     }
 }
 
-/* ========================================================================== */
 /* INTERRUPTS */
-/* ========================================================================== */
 void TIM3_IRQHandler(void) {
     static uint32_t t_start = 0;
     if (TIM3->SR & TIM_SR_CC1IF) {
@@ -398,17 +291,33 @@ void TIM3_IRQHandler(void) {
     }
 }
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART1) {
+        char temp_char = (char)hal_rx_byte;
+        if (temp_char >= 32 && temp_char <= 126) {
+            rx_buffer = temp_char;
+            rx_flag = 1;
+
+            char debug[20];
+            sprintf(debug, "RX:%c\r\n", temp_char);
+            UART_SendString(debug);
+        }
+        HAL_UART_Receive_IT(&huart1, &hal_rx_byte, 1);
+    }
+}
+
 /* ========================================================================== */
 /* MAIN */
 /* ========================================================================== */
 int main(void) {
-    Timebase_Init_RegisterLevel();
+    HAL_Init();
     GPIO_Init_RegisterLevel();
     Timers_Init();
     Local_MX_I2C1_Init();
     Local_MX_USART1_UART_Init();
 
     LCD_Init();
+    HAL_UART_Receive_IT(&huart1, &hal_rx_byte, 1);
 
     UART_SendString("\r\n==================================\r\n");
     UART_SendString(" ROBOT ADAS CORE ONLINE!\r\n");
@@ -416,9 +325,7 @@ int main(void) {
     UART_SendString("BOOT MODE - Send 'A' or 'M' to start\r\n");
 
     while (1) {
-        uint32_t current_time = Millis();
-
-        UART1_PollReceive();
+        uint32_t current_time = HAL_GetTick();
 
         /* Sensor Trigger */
         if (current_time - last_sensor_time >= 60) {
@@ -431,7 +338,7 @@ int main(void) {
         /* Tính d_safe */
         if (current_time - last_velocity_time >= 1000) {
             float delta_d = previous_distance - filtered_distance;
-            current_speed_m_s = (delta_d > 0.1f) ? (delta_d / 100.0f) : 0.0f;
+current_speed_m_s = (delta_d > 0.1f) ? (delta_d / 100.0f) : 0.0f;
             float calculated = (current_speed_m_s * 0.5f) + (current_speed_m_s * current_speed_m_s / 5.0f);
             d_safe = calculated * 100.0f;
             if (d_safe < 22.0f) d_safe = 22.0f;
@@ -443,6 +350,7 @@ int main(void) {
         /* ==================== XỬ LÝ CHẾ ĐỘ MANUAL (LUÔN QUÉT AN TOÀN) ==================== */
         if (current_mode == MANUAL_MODE) {
 
+            // 1. ĐỌC VÀ XỬ LÝ LỆNH BLUETOOTH TRƯỚC
             uint8_t has_new_cmd = 0;
             char cmd = 0;
 
@@ -453,45 +361,50 @@ int main(void) {
                 has_new_cmd = 1;
             }
 
+            // 2. KIỂM TRA ĐIỀU KIỆN KHOẢNG CÁCH NGUY HIỂM (PHANH KHẨN CẤP)
             if (filtered_distance <= d_safe) {
 
+                // Nếu có lệnh mới truyền xuống
                 if (has_new_cmd) {
                     if (cmd == 'C' || cmd == 'c') {
                         current_mode = AUTO_MODE;
                     }
                     else if (cmd == 'A' || cmd == 'a') {
-                        /* Bỏ qua lệnh tiến khi khoảng cách nguy hiểm */
+                        // BỎ QUA LỆNH TIẾN: Không làm gì cả để hệ thống tiếp tục phanh phía dưới
                     }
                     else if (cmd == 'B' || cmd == 'b') {
-                        Set_Motor(-50, -50);
-                        is_braking_active = 0;
+                        Set_Motor(-50, -50);      // Lùi cố định 50% (Cho phép lùi ra xa vật cản)
+                        is_braking_active = 0;    // Thoát trạng thái phanh tự động để ưu tiên lệnh lùi người dùng
                     }
                     else if (cmd == 'R' || cmd == 'r') {
-                        Set_Motor(-80, 80);
+                        Set_Motor(-80, 80);       // Quay trái
                         is_braking_active = 0;
                     }
                     else if (cmd == 'L' || cmd == 'l') {
-                        Set_Motor(80, -80);
+                        Set_Motor(80, -80);       // Quay phải
                         is_braking_active = 0;
                     }
                     else if (cmd == 'S' || cmd == 's') {
-                        Set_Motor(0, 0);
+                        Set_Motor(0, 0);          // Dừng xe chủ động
                         is_braking_active = 0;
                     }
                 }
 
+                // Nếu người dùng không bấm lùi/quay/dừng hoặc vừa bấm lệnh TIẾN bị chặn,
+                // thì hệ thống tự động phanh khẩn cấp kích hoạt
                 if (cmd == 0 || cmd == 'A' || cmd == 'a') {
                     if (!is_braking_active) {
                         is_braking_active = 1;
-                        brake_start_time = Millis();
+                        brake_start_time = HAL_GetTick();
                     }
-                    if (Millis() - brake_start_time <= 120) {
-                        Set_Motor(-70, -70);
+                    if (HAL_GetTick() - brake_start_time <= 120) {
+                        Set_Motor(-70, -70);     // Phanh lùi khẩn cấp
                     } else {
-                        Set_Motor(0, 0);
+                        Set_Motor(0, 0);          // Ép đứng yên
                     }
-                }
+}
             }
+            /* Trường hợp khoảng cách AN TOÀN (> d_safe): Xe chạy bình thường theo lệnh */
             else {
                 is_braking_active = 0;
 
@@ -500,19 +413,19 @@ int main(void) {
                         current_mode = AUTO_MODE;
                     }
                     else if (cmd == 'A' || cmd == 'a') {
-                        Set_Motor(40, 40);
+                        Set_Motor(40, 40);        // Tiến cố định 50%
                     }
                     else if (cmd == 'B' || cmd == 'b') {
-                        Set_Motor(-40, -40);
+                        Set_Motor(-40, -40);      // Lùi cố định 50%
                     }
                     else if (cmd == 'R' || cmd == 'r') {
-                        Set_Motor(-50, 50);
+                        Set_Motor(-50, 50);       // Quay trái cố định
                     }
                     else if (cmd == 'L' || cmd == 'l') {
-                        Set_Motor(50, -50);
+                        Set_Motor(50, -50);       // Quay phải cố định
                     }
                     else if (cmd == 'S' || cmd == 's') {
-                        Set_Motor(0, 0);
+                        Set_Motor(0, 0);          // Dừng xe
                     }
                 }
             }
@@ -565,7 +478,7 @@ int main(void) {
                          (unsigned long)((uint32_t)filtered_distance),
                          Get_Safety_Text(safety_state));
                 LCD_Print_Fixed(lcd_line);
-            }
+}
             last_lcd_time = current_time;
         }
     }
